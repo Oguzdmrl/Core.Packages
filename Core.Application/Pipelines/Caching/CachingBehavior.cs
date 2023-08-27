@@ -23,7 +23,7 @@ public class CachingBehavior<TRequest, TResponse> : IPipelineBehavior<TRequest, 
 
     public async Task<TResponse> Handle(TRequest request, RequestHandlerDelegate<TResponse> next, CancellationToken cancellationToken)
     {
-        if (request.ByPassCache)
+        if (request.BypassCache)
             return await next();
 
         TResponse response;
@@ -49,10 +49,53 @@ public class CachingBehavior<TRequest, TResponse> : IPipelineBehavior<TRequest, 
         DistributedCacheEntryOptions cacheOptions = new() { SlidingExpiration = slidingExpiration };
 
         byte[] serializedData = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(response));
-        await _cache.SetAsync(request.CacheKey, serializedData, cacheOptions, cancellationToken);
 
+        await _cache.SetAsync(request.CacheKey, serializedData, cacheOptions, cancellationToken);
         _logger.LogInformation($"Added to Cache -> {request.CacheKey}");
 
+        if (request.CacheGroupKey != null)
+            await addCacheKeyToGroup(request, slidingExpiration, cancellationToken);
+
         return response;
+    }
+
+    private async Task addCacheKeyToGroup(TRequest request, TimeSpan slidingExpiration, CancellationToken cancellationToken)
+    {
+        byte[]? cacheGroupCache = await _cache.GetAsync(key: request.CacheGroupKey!, cancellationToken);
+        HashSet<string> cacheKeysInGroup;
+        if (cacheGroupCache != null)
+        {
+            cacheKeysInGroup = JsonSerializer.Deserialize<HashSet<string>>(Encoding.Default.GetString(cacheGroupCache))!;
+            if (!cacheKeysInGroup.Contains(request.CacheKey))
+                cacheKeysInGroup.Add(request.CacheKey);
+        }
+        else
+            cacheKeysInGroup = new HashSet<string>(new[] { request.CacheKey });
+        byte[] newCacheGroupCache = JsonSerializer.SerializeToUtf8Bytes(cacheKeysInGroup);
+
+        byte[]? cacheGroupCacheSlidingExpirationCache = await _cache.GetAsync(
+            key: $"{request.CacheGroupKey}SlidingExpiration",
+            cancellationToken
+        );
+        int? cacheGroupCacheSlidingExpirationValue = null;
+        if (cacheGroupCacheSlidingExpirationCache != null)
+            cacheGroupCacheSlidingExpirationValue = Convert.ToInt32(Encoding.Default.GetString(cacheGroupCacheSlidingExpirationCache));
+        if (cacheGroupCacheSlidingExpirationValue == null || slidingExpiration.TotalSeconds > cacheGroupCacheSlidingExpirationValue)
+            cacheGroupCacheSlidingExpirationValue = Convert.ToInt32(slidingExpiration.TotalSeconds);
+        byte[] serializeCachedGroupSlidingExpirationData = JsonSerializer.SerializeToUtf8Bytes(cacheGroupCacheSlidingExpirationValue);
+
+        DistributedCacheEntryOptions cacheOptions =
+            new() { SlidingExpiration = TimeSpan.FromSeconds(Convert.ToDouble(cacheGroupCacheSlidingExpirationValue)) };
+
+        await _cache.SetAsync(key: request.CacheGroupKey!, newCacheGroupCache, cacheOptions, cancellationToken);
+        _logger.LogInformation($"Added to Cache -> {request.CacheGroupKey}");
+
+        await _cache.SetAsync(
+            key: $"{request.CacheGroupKey}SlidingExpiration",
+            serializeCachedGroupSlidingExpirationData,
+            cacheOptions,
+            cancellationToken
+        );
+        _logger.LogInformation($"Added to Cache -> {request.CacheGroupKey}SlidingExpiration");
     }
 }
